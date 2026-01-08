@@ -6,19 +6,24 @@ A macOS bash script that transforms Google Photos Takeout exports into a clean, 
 
 This script solves the challenge of migrating your entire Google Photos library to Proton Drive by:
 
+- **Collecting ALL photos** from both date folders AND album folders into one unified library
 - **Merging JSON metadata** from Google Takeout into file EXIF data
 - **Fixing timestamps** so photos reflect their actual creation date (not export date)
+- **Removing Live Photo videos** (the short video clips paired with photos)
+- **Filtering short videos** (keeps only videos 5 seconds or longer)
 - **De-duplicating** photos across multiple Takeout archives
-- **Organizing intelligently** into `ALL_PHOTOS` (by year) and `ALBUMS` (by album name)
-- **Preserving GPS coordinates** and other metadata when available
+- **Organizing by year** into a single `ALL_PHOTOS` folder
 - **Generating a detailed report** with counts, sizes, and upload instructions
 
 ## ✨ Features
 
 - ✅ Automatic prerequisite checking and installation
 - ✅ Handles multiple Google Takeout exports in a single run
+- ✅ Collects from ALL folders (date-based AND albums) - no photos left behind
 - ✅ Supports all common image formats (JPG, JPEG, PNG, HEIC, GIF, WebP, BMP, TIFF)
 - ✅ Supports video formats (MP4, MOV, AVI, MKV, M4V, 3GP)
+- ✅ Automatically removes Live Photo video components
+- ✅ Filters out videos under 5 seconds
 - ✅ Fixes EXIF DateTimeOriginal and file modification dates
 - ✅ Preserves GPS coordinates when available
 - ✅ Smart duplicate detection using file hashing
@@ -69,8 +74,8 @@ The script will ask for:
 
 Example paths:
 ```
-Takeout:  /Users/chase/Downloads/GoogleTakeout/Takeout/Google Photos
-Output:   /Users/chase/ProcessedPhotos
+Takeout:  /Users/yourname/Downloads/GoogleTakeout/Takeout/Google Photos
+Output:   /Users/yourname/ProcessedPhotos
 ```
 
 ## 📂 Output Structure
@@ -86,9 +91,9 @@ output_folder/
 │   ├── 2016/
 │   ├── 2017/
 │   └── ...
-├── ALBUMS/                  # Original album structure preserved
+├── ALBUMS/                  # Album structure preserved for reference
 │   ├── Vacation 2020/
-│   │   ├── beach1.jpg
+│   │   ├── beach.jpg
 │   │   └── sunset.jpg
 │   ├── Family/
 │   └── ...
@@ -96,54 +101,44 @@ output_folder/
 └── duplicates.log           # Any duplicate files found (if any)
 ```
 
+**Key Points:**
+- `ALL_PHOTOS` contains every photo/video organized by year - upload this to Proton Drive Photos
+- `ALBUMS` contains copies organized by album name - use for reference when creating albums in Proton Drive
+- All album photos are validated to exist in `ALL_PHOTOS`, so no re-uploading is needed when creating albums
+
 ## 📤 Uploading to Proton Drive
 
-### Method 1: Using Proton Drive Desktop App
+### Using Proton Drive Desktop App or Web
 
-1. Open Proton Drive on your Mac
+1. Open Proton Drive on your Mac or go to [drive.proton.me](https://drive.proton.me)
 2. Navigate to the **Photos** section
 3. Drag and drop the contents of `ALL_PHOTOS` folder
 4. Proton Drive will automatically organize by EXIF date
 
-### Method 2: Using Web Interface
+### Creating Albums in Proton Drive
 
-1. Go to [drive.proton.me](https://drive.proton.me)
-2. Access the Photos section
-3. Upload folders using the web upload feature
+Since all album photos are validated to exist in `ALL_PHOTOS`:
+1. Upload `ALL_PHOTOS` first (this is your main photo timeline)
+2. In Proton Drive Photos, create new albums
+3. Select photos from your uploaded library to add to albums
+4. Use the `ALBUMS` folder as a reference for which photos belong to each album
 
-### Creating Albums
+**No duplicate uploading required!** Every photo in `ALBUMS` is guaranteed to already exist in `ALL_PHOTOS`.
 
-1. **Upload `ALL_PHOTOS` first** - This becomes your main photo timeline
-2. In Proton Drive Photos, create new albums matching your original album names
-3. Either:
-   - Re-upload the `ALBUMS` folder contents to each album, OR
-   - Select already-uploaded photos and add them to albums
+## 🔧 What Gets Filtered
 
-> **Tip:** Proton Drive will use the corrected EXIF DateTimeOriginal to automatically sort everything chronologically.
+### Live Photos
+The script detects and removes Live Photo video components by looking for video files that have a matching image file with the same base name. For example:
+- `IMG_1234.HEIC` (kept - the photo)
+- `IMG_1234.MOV` (removed - the Live Photo video)
 
-## 🔧 Usage Examples
+### Short Videos
+Videos under 5 seconds are automatically removed. This filters out:
+- Live Photo videos that weren't caught by name matching
+- Accidental recordings
+- Burst video clips
 
-### Basic usage (interactive):
-```bash
-./google_photos_migration.sh
-```
-
-### Processing specific Takeout export:
-```bash
-./google_photos_migration.sh
-# When prompted, enter:
-# Takeout path: ~/Downloads/takeout-20250107
-# Output path: ~/ProcessedPhotos
-```
-
-### Handling multiple exports:
-1. Merge all Takeout exports into a single folder:
-   ```bash
-   mkdir ~/MergedTakeout
-   cp -r ~/takeout1/Takeout ~/MergedTakeout/
-   cp -r ~/takeout2/Takeout ~/MergedTakeout/
-   ```
-2. Run the script with the merged folder path
+Videos 5 seconds or longer are kept and have their metadata fixed.
 
 ## 🛠️ What Each Step Does
 
@@ -151,11 +146,10 @@ output_folder/
 |------|--------|------|
 | 1 | Checks Homebrew, Python, exiftool, jq | ~5 seconds |
 | 2 | Collects input paths from you | Interactive |
-| 3 | Installs google-photos-takeout-helper | ~30 seconds |
-| 4 | Processes photos, merges JSON metadata | Varies* |
-| 5 | De-duplicates across collections | Varies* |
-| 6 | Organizes final structure | ~1 minute |
-| 7 | Generates report and shows results | ~1 minute |
+| 3 | Sets up tools | ~30 seconds |
+| 4 | Processes ALL photos, filters videos, merges metadata | Varies* |
+| 5 | Final de-duplication pass | Varies* |
+| 6 | Organizes, verifies, generates report | ~1 minute |
 
 *Time depends on library size. For reference:
 - 10,000 photos: ~5-10 minutes
@@ -176,17 +170,17 @@ output_folder/
 
 ### Organization
 - **Duplicates** - Removed using MD5 hash comparison
-- **Folder structure** - Organized by year and album name
-- **Naming conflicts** - Resolved automatically
+- **Folder structure** - Organized by year
+- **Naming conflicts** - Resolved automatically with timestamp suffixes
 
 ## ⚠️ Important Notes
 
 1. **Backup your originals** - Keep the original Takeout export until you verify everything in Proton Drive
 2. **Disk space** - You'll need space for both original Takeout + processed output (roughly 2x your photo library size)
-3. **macOS only** - This script is designed specifically for macOS. Linux/Windows users should adapt as needed
+3. **macOS only** - This script is designed specifically for macOS
 4. **Empty folders** - Removed automatically during organization
 5. **Large libraries** - The script provides progress indicators but can take time with 100k+ photos
-6. **JSON matching** - The script tries multiple strategies to match JSON sidecars to photos
+6. **Album validation** - The script ensures every album photo exists in `ALL_PHOTOS` so you only need to upload once
 
 ## 🐛 Troubleshooting
 
@@ -265,17 +259,18 @@ Takeout/
 
 The `.json` files contain the metadata (timestamps, GPS, etc.) that this script extracts and applies to the photos.
 
+**Important:** Photos can exist in both "Photos from YYYY" folders AND album folders. This script collects from ALL locations and de-duplicates, ensuring no photos are missed.
+
 ## 🚀 Next Steps
 
 After migration:
 
-1. ✅ Verify photos in processed folders
+1. ✅ Verify photos in `ALL_PHOTOS` folder look correct
 2. ✅ Check `MIGRATION_REPORT.txt` for statistics  
-3. ✅ Upload `ALL_PHOTOS` to Proton Drive
-4. ✅ Create albums in Proton Drive and populate with `ALBUMS` content
-5. ✅ Verify dates and organization in Proton Drive
-6. ✅ Keep original Takeout as backup for a few weeks
-7. ✅ Delete original Takeout when confident everything is correct
+3. ✅ Upload `ALL_PHOTOS` contents to Proton Drive Photos
+4. ✅ Verify dates and organization in Proton Drive
+5. ✅ Keep original Takeout as backup for a few weeks
+6. ✅ Delete original Takeout when confident everything is correct
 
 ---
 

@@ -164,6 +164,102 @@ setup_takeout_helper() {
 }
 
 ################################################################################
+# Helper: Check if a file is a Live Photo video component
+################################################################################
+is_live_photo_video() {
+    local video_file="$1"
+    local search_dir="$2"
+    local filename=$(basename "$video_file")
+    local base_name="${filename%.*}"
+    local ext_lower=$(echo "${filename##*.}" | tr '[:upper:]' '[:lower:]')
+    
+    # Only check video files
+    if [[ ! "$ext_lower" =~ ^(mov|mp4|m4v)$ ]]; then
+        return 1
+    fi
+    
+    # Check if there's a matching image file (HEIC, JPG, JPEG, PNG)
+    # Live Photos typically have same base name with different extension
+    for img_ext in heic HEIC jpg JPG jpeg JPEG png PNG; do
+        if [ -f "$search_dir/${base_name}.${img_ext}" ]; then
+            return 0  # This IS a Live Photo video
+        fi
+    done
+    
+    return 1  # Not a Live Photo video
+}
+
+################################################################################
+# Helper: Get video duration in seconds
+################################################################################
+get_video_duration() {
+    local video_file="$1"
+    local duration=0
+    
+    # Try to get duration using exiftool (most reliable for various formats)
+    duration=$(exiftool -Duration -s3 "$video_file" 2>/dev/null | grep -oE '^[0-9]+\.?[0-9]*' | head -1)
+    
+    # If duration is in HH:MM:SS format, convert to seconds
+    if [ -z "$duration" ]; then
+        local time_str=$(exiftool -Duration -s3 "$video_file" 2>/dev/null)
+        if [[ "$time_str" =~ ([0-9]+):([0-9]+):([0-9]+) ]]; then
+            duration=$(( ${BASH_REMATCH[1]} * 3600 + ${BASH_REMATCH[2]} * 60 + ${BASH_REMATCH[3]} ))
+        elif [[ "$time_str" =~ ([0-9]+):([0-9]+) ]]; then
+            duration=$(( ${BASH_REMATCH[1]} * 60 + ${BASH_REMATCH[2]} ))
+        elif [[ "$time_str" =~ ([0-9]+\.?[0-9]*)\ *s ]]; then
+            duration="${BASH_REMATCH[1]}"
+        fi
+    fi
+    
+    # Fallback: try ffprobe if available
+    if [ -z "$duration" ] || [ "$duration" = "0" ]; then
+        if command -v ffprobe &> /dev/null; then
+            duration=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$video_file" 2>/dev/null | cut -d. -f1)
+        fi
+    fi
+    
+    # Return 0 if we couldn't determine duration (will be filtered out)
+    echo "${duration:-0}"
+}
+
+################################################################################
+# Helper: Check if file should be kept (not Live Photo, videos >= 5 sec)
+################################################################################
+should_keep_file() {
+    local file="$1"
+    local search_dir="$2"
+    local filename=$(basename "$file")
+    local ext_lower=$(echo "${filename##*.}" | tr '[:upper:]' '[:lower:]')
+    
+    # Always keep still images
+    if [[ "$ext_lower" =~ ^(jpg|jpeg|png|heic|gif|webp|bmp|tiff|tif)$ ]]; then
+        return 0  # Keep
+    fi
+    
+    # For videos, check if it's a Live Photo component
+    if [[ "$ext_lower" =~ ^(mov|mp4|m4v|avi|mkv|3gp)$ ]]; then
+        # Check if this is a Live Photo video
+        if is_live_photo_video "$file" "$search_dir"; then
+            return 1  # Don't keep - it's a Live Photo video
+        fi
+        
+        # Check video duration (keep if >= 5 seconds)
+        local duration=$(get_video_duration "$file")
+        if [ -n "$duration" ] && [ "$duration" != "" ]; then
+            # Handle decimal durations
+            local int_duration=$(echo "$duration" | cut -d. -f1)
+            if [ -n "$int_duration" ] && [ "$int_duration" -ge 5 ] 2>/dev/null; then
+                return 0  # Keep - video is 5+ seconds
+            fi
+        fi
+        
+        return 1  # Don't keep - video is too short or duration unknown
+    fi
+    
+    return 1  # Don't keep unknown formats
+}
+
+################################################################################
 # Step 4: Process Photos with Metadata Merge
 ################################################################################
 process_photos_with_metadata() {
@@ -175,6 +271,7 @@ process_photos_with_metadata() {
     
     log_info "Processing photos and merging metadata..."
     log_info "This may take a while depending on library size..."
+    log_info "Filtering: Removing Live Photo videos, keeping videos >= 5 seconds"
     echo ""
     
     # We'll process the photos ourselves since google-photos-takeout-helper
@@ -183,88 +280,273 @@ process_photos_with_metadata() {
     local TOTAL_COPIED=0
     local TOTAL_ALBUMS=0
     local TOTAL_DATE_PHOTOS=0
+    local LIVE_PHOTOS_SKIPPED=0
+    local SHORT_VIDEOS_SKIPPED=0
+    
+    # Track all files added to ALL_PHOTOS for album validation
+    ALL_PHOTOS_HASHES_FILE=$(mktemp)
+    
+    # PHASE 1: First, collect ALL photos from ALL folders into ALL_PHOTOS
+    # This ensures every photo exists in ALL_PHOTOS organized by year
+    log_info "Phase 1: Collecting ALL photos into ALL_PHOTOS (by year)..."
     
     # Find all Google Photos directories
     while IFS= read -r google_photos_dir; do
         log_info "Processing: $google_photos_dir"
         
-        # Process each subfolder
+        # Process each subfolder (both date folders AND album folders)
         for subfolder in "$google_photos_dir"/*/; do
             if [ -d "$subfolder" ]; then
                 folder_name=$(basename "$subfolder")
                 
-                # Check if it's a date-based folder (Photos from YYYY)
+                # Skip certain system folders
+                if [[ "$folder_name" == "Untitled"* ]] || [[ "$folder_name" == "Failed"* ]]; then
+                    continue
+                fi
+                
+                # Determine year for this folder
+                local YEAR=""
                 if [[ "$folder_name" =~ ^Photos\ from\ ([0-9]{4})$ ]]; then
                     YEAR="${BASH_REMATCH[1]}"
-                    log_info "  📅 Date folder: $folder_name -> ALL_PHOTOS/$YEAR/"
-                    
-                    # Create year folder in output
-                    mkdir -p "$PROCESSED_FOLDER/$YEAR"
-                    
-                    # Copy all media files (not JSON) to the year folder
-                    for file in "$subfolder"/*; do
-                        if [ -f "$file" ]; then
-                            filename=$(basename "$file")
-                            extension="${filename##*.}"
-                            ext_lower=$(echo "$extension" | tr '[:upper:]' '[:lower:]')
-                            
-                            # Skip JSON files and other non-media
-                            if [[ "$ext_lower" =~ ^(jpg|jpeg|png|heic|gif|mp4|mov|avi|mkv|webp|bmp|tiff|tif|3gp|m4v)$ ]]; then
-                                # Check if file already exists, add suffix if needed
-                                dest="$PROCESSED_FOLDER/$YEAR/$filename"
-                                if [ -f "$dest" ]; then
-                                    base="${filename%.*}"
-                                    dest="$PROCESSED_FOLDER/$YEAR/${base}_$(date +%s%N | cut -c1-13).${extension}"
-                                fi
-                                cp -p "$file" "$dest" 2>/dev/null && ((TOTAL_DATE_PHOTOS++)) || true
-                            fi
-                        fi
-                    done
+                    log_info "  📅 Date folder: $folder_name"
                 else
-                    # This is an album folder
-                    # Skip certain system folders
-                    if [[ "$folder_name" == "Untitled"* ]] || [[ "$folder_name" == "Failed"* ]]; then
-                        continue
-                    fi
-                    
-                    log_info "  📁 Album: $folder_name"
-                    ((TOTAL_ALBUMS++)) || true
-                    
-                    # Create album folder in output
-                    mkdir -p "$ALBUMS_FOLDER/$folder_name"
-                    
-                    # Copy all media files to the album folder
-                    for file in "$subfolder"/*; do
-                        if [ -f "$file" ]; then
-                            filename=$(basename "$file")
-                            extension="${filename##*.}"
-                            ext_lower=$(echo "$extension" | tr '[:upper:]' '[:lower:]')
+                    # Album folder - we'll extract year from each file's JSON or EXIF
+                    log_info "  📁 Album folder: $folder_name (extracting to ALL_PHOTOS)"
+                fi
+                
+                # Copy all media files to ALL_PHOTOS
+                for file in "$subfolder"/*; do
+                    if [ -f "$file" ]; then
+                        filename=$(basename "$file")
+                        extension="${filename##*.}"
+                        ext_lower=$(echo "$extension" | tr '[:upper:]' '[:lower:]')
                             
-                            # Skip JSON files
-                            if [[ "$ext_lower" =~ ^(jpg|jpeg|png|heic|gif|mp4|mov|avi|mkv|webp|bmp|tiff|tif|3gp|m4v)$ ]]; then
-                                dest="$ALBUMS_FOLDER/$folder_name/$filename"
-                                if [ ! -f "$dest" ]; then
-                                    cp -p "$file" "$dest" 2>/dev/null && ((TOTAL_COPIED++)) || true
+                        # Skip JSON files and other non-media
+                        if [[ "$ext_lower" =~ ^(jpg|jpeg|png|heic|gif|mp4|mov|avi|mkv|webp|bmp|tiff|tif|3gp|m4v)$ ]]; then
+                            # Check if we should keep this file (not Live Photo, video >= 5 sec)
+                            if ! should_keep_file "$file" "$subfolder"; then
+                                # Track what we're skipping
+                                if is_live_photo_video "$file" "$subfolder"; then
+                                    ((LIVE_PHOTOS_SKIPPED++)) || true
+                                else
+                                    ((SHORT_VIDEOS_SKIPPED++)) || true
+                                fi
+                                continue
+                            fi
+                            
+                            # Determine year if not already set (for album folders)
+                            local FILE_YEAR="$YEAR"
+                            if [ -z "$FILE_YEAR" ]; then
+                                # Try to get year from JSON sidecar
+                                local base_name="${filename%.*}"
+                                local json_file=""
+                                for json_path in "$subfolder/${filename}.json" "$subfolder/${base_name}.json"; do
+                                    if [ -f "$json_path" ]; then
+                                        json_file="$json_path"
+                                        break
+                                    fi
+                                done
+                                
+                                if [ -n "$json_file" ]; then
+                                    local timestamp=$(jq -r '.photoTakenTime.timestamp // .creationTime.timestamp // empty' "$json_file" 2>/dev/null)
+                                    if [ -n "$timestamp" ] && [ "$timestamp" != "null" ]; then
+                                        FILE_YEAR=$(date -r "$timestamp" "+%Y" 2>/dev/null)
+                                    fi
+                                fi
+                                
+                                # Fallback: try EXIF
+                                if [ -z "$FILE_YEAR" ]; then
+                                    FILE_YEAR=$(exiftool -DateTimeOriginal -s3 "$file" 2>/dev/null | cut -d: -f1)
+                                fi
+                                
+                                # Final fallback: use current year
+                                if [ -z "$FILE_YEAR" ] || ! [[ "$FILE_YEAR" =~ ^[0-9]{4}$ ]]; then
+                                    FILE_YEAR="Unknown"
                                 fi
                             fi
+                            
+                            # Create year folder and copy
+                            mkdir -p "$PROCESSED_FOLDER/$FILE_YEAR"
+                            
+                            # Check if file already exists, add suffix if needed
+                            dest="$PROCESSED_FOLDER/$FILE_YEAR/$filename"
+                            if [ -f "$dest" ]; then
+                                # Check if it's the same file (by hash)
+                                local new_hash=$(md5 -q "$file" 2>/dev/null)
+                                local existing_hash=$(md5 -q "$dest" 2>/dev/null)
+                                if [ "$new_hash" = "$existing_hash" ]; then
+                                    continue  # Skip duplicate
+                                fi
+                                base="${filename%.*}"
+                                dest="$PROCESSED_FOLDER/$FILE_YEAR/${base}_$(date +%s%N | cut -c1-13).${extension}"
+                            fi
+                            
+                            cp -p "$file" "$dest" 2>/dev/null && ((TOTAL_DATE_PHOTOS++)) || true
+                            
+                            # Track file hash for album validation
+                            echo "$(md5 -q "$dest" 2>/dev/null)" >> "$ALL_PHOTOS_HASHES_FILE"
                         fi
-                    done
-                fi
+                    fi
+                done
             fi
         done
     done < <(find "$TAKEOUT_INPUT" -type d -name "Google Photos" 2>/dev/null)
     
     echo ""
-    log_success "Copied $TOTAL_DATE_PHOTOS photos to ALL_PHOTOS (by year)"
-    log_success "Copied photos from $TOTAL_ALBUMS albums to ALBUMS folder"
+    log_success "Copied $TOTAL_DATE_PHOTOS photos/videos to ALL_PHOTOS (by year)"
+    log_info "Skipped $LIVE_PHOTOS_SKIPPED Live Photo videos"
+    log_info "Skipped $SHORT_VIDEOS_SKIPPED short videos (< 5 seconds)"
+    
+    # PHASE 2: Now create album structure that references ALL_PHOTOS
+    log_info ""
+    log_info "Phase 2: Creating album structure..."
+    
+    # Process albums again, but this time only create references
+    while IFS= read -r google_photos_dir; do
+        for subfolder in "$google_photos_dir"/*/; do
+            if [ -d "$subfolder" ]; then
+                folder_name=$(basename "$subfolder")
+                
+                # Skip date folders and system folders
+                if [[ "$folder_name" =~ ^Photos\ from\ [0-9]{4}$ ]]; then
+                    continue
+                fi
+                if [[ "$folder_name" == "Untitled"* ]] || [[ "$folder_name" == "Failed"* ]]; then
+                    continue
+                fi
+                
+                log_info "  📁 Album: $folder_name"
+                ((TOTAL_ALBUMS++)) || true
+                
+                mkdir -p "$ALBUMS_FOLDER/$folder_name"
+                
+                # Copy album photos (these should already exist in ALL_PHOTOS)
+                for file in "$subfolder"/*; do
+                    if [ -f "$file" ]; then
+                        filename=$(basename "$file")
+                        extension="${filename##*.}"
+                        ext_lower=$(echo "$extension" | tr '[:upper:]' '[:lower:]')
+                        
+                        if [[ "$ext_lower" =~ ^(jpg|jpeg|png|heic|gif|mp4|mov|avi|mkv|webp|bmp|tiff|tif|3gp|m4v)$ ]]; then
+                            # Check if we should keep this file
+                            if ! should_keep_file "$file" "$subfolder"; then
+                                continue
+                            fi
+                            
+                            dest="$ALBUMS_FOLDER/$folder_name/$filename"
+                            if [ ! -f "$dest" ]; then
+                                cp -p "$file" "$dest" 2>/dev/null && ((TOTAL_COPIED++)) || true
+                            fi
+                        fi
+                    fi
+                done
+            fi
+        done
+    done < <(find "$TAKEOUT_INPUT" -type d -name "Google Photos" 2>/dev/null)
+    
+    log_success "Created $TOTAL_ALBUMS album folders"
+    
+    # Clean up temp file
+    rm -f "$ALL_PHOTOS_HASHES_FILE"
     
     # Now fix metadata using JSON sidecars
+    log_info ""
     log_info "Fixing metadata from JSON sidecars..."
     fix_all_metadata
+    
+    # Validate album photos exist in ALL_PHOTOS
+    log_info ""
+    validate_album_photos
 }
 
 ################################################################################
-# Step 4b: Fix Metadata for All Photos using JSON sidecars
+# Step 4b: Validate Album Photos Exist in ALL_PHOTOS
+################################################################################
+validate_album_photos() {
+    log_info "Validating all album photos exist in ALL_PHOTOS..."
+    
+    local MISSING_COUNT=0
+    local FOUND_COUNT=0
+    local TOTAL_ALBUM_FILES=0
+    
+    # Build hash index of ALL_PHOTOS
+    log_info "Building ALL_PHOTOS index..."
+    declare -A ALL_PHOTOS_INDEX
+    
+    while IFS= read -r photo; do
+        local hash=$(md5 -q "$photo" 2>/dev/null)
+        if [ -n "$hash" ]; then
+            ALL_PHOTOS_INDEX["$hash"]="$photo"
+        fi
+    done < <(find "$PROCESSED_FOLDER" -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.heic" -o -iname "*.png" -o -iname "*.gif" -o -iname "*.mp4" -o -iname "*.mov" -o -iname "*.avi" -o -iname "*.mkv" -o -iname "*.m4v" -o -iname "*.3gp" -o -iname "*.webp" -o -iname "*.bmp" -o -iname "*.tiff" -o -iname "*.tif" \) 2>/dev/null)
+    
+    log_info "Checking album files..."
+    
+    # Check each album file
+    while IFS= read -r album_photo; do
+        ((TOTAL_ALBUM_FILES++)) || true
+        
+        local hash=$(md5 -q "$album_photo" 2>/dev/null)
+        local filename=$(basename "$album_photo")
+        
+        if [ -n "${ALL_PHOTOS_INDEX[$hash]+x}" ]; then
+            ((FOUND_COUNT++)) || true
+        else
+            # Photo not in ALL_PHOTOS - need to add it
+            ((MISSING_COUNT++)) || true
+            
+            # Try to determine year and add to ALL_PHOTOS
+            local FILE_YEAR="Unknown"
+            local album_dir=$(dirname "$album_photo")
+            local base_name="${filename%.*}"
+            
+            # Try JSON sidecar from original takeout
+            while IFS= read -r json_file; do
+                if [ -f "$json_file" ]; then
+                    local timestamp=$(jq -r '.photoTakenTime.timestamp // .creationTime.timestamp // empty' "$json_file" 2>/dev/null)
+                    if [ -n "$timestamp" ] && [ "$timestamp" != "null" ]; then
+                        FILE_YEAR=$(date -r "$timestamp" "+%Y" 2>/dev/null)
+                        break
+                    fi
+                fi
+            done < <(find "$TAKEOUT_INPUT" \( -name "${filename}.json" -o -name "${base_name}.json" \) -type f 2>/dev/null | head -2)
+            
+            # Fallback: EXIF
+            if [ "$FILE_YEAR" = "Unknown" ] || ! [[ "$FILE_YEAR" =~ ^[0-9]{4}$ ]]; then
+                FILE_YEAR=$(exiftool -DateTimeOriginal -s3 "$album_photo" 2>/dev/null | cut -d: -f1)
+            fi
+            
+            if [ -z "$FILE_YEAR" ] || ! [[ "$FILE_YEAR" =~ ^[0-9]{4}$ ]]; then
+                FILE_YEAR="Unknown"
+            fi
+            
+            # Copy to ALL_PHOTOS
+            mkdir -p "$PROCESSED_FOLDER/$FILE_YEAR"
+            local dest="$PROCESSED_FOLDER/$FILE_YEAR/$filename"
+            if [ -f "$dest" ]; then
+                local extension="${filename##*.}"
+                base_name="${filename%.*}"
+                dest="$PROCESSED_FOLDER/$FILE_YEAR/${base_name}_$(date +%s%N | cut -c1-13).${extension}"
+            fi
+            cp -p "$album_photo" "$dest" 2>/dev/null
+            log_info "  Added missing: $filename -> ALL_PHOTOS/$FILE_YEAR/"
+        fi
+        
+        if [ $((TOTAL_ALBUM_FILES % 100)) -eq 0 ]; then
+            echo -ne "\r  Validated $TOTAL_ALBUM_FILES album files..."
+        fi
+    done < <(find "$ALBUMS_FOLDER" -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.heic" -o -iname "*.png" -o -iname "*.gif" -o -iname "*.mp4" -o -iname "*.mov" -o -iname "*.avi" -o -iname "*.mkv" -o -iname "*.m4v" -o -iname "*.3gp" -o -iname "*.webp" -o -iname "*.bmp" -o -iname "*.tiff" -o -iname "*.tif" \) 2>/dev/null)
+    
+    echo ""
+    log_success "Album validation complete: $FOUND_COUNT files already in ALL_PHOTOS"
+    if [ "$MISSING_COUNT" -gt 0 ]; then
+        log_success "Added $MISSING_COUNT missing files to ALL_PHOTOS"
+    fi
+    log_info "All album photos are now guaranteed to exist in ALL_PHOTOS!"
+}
+
+################################################################################
+# Step 4c: Fix Metadata for All Photos using JSON sidecars
 ################################################################################
 fix_all_metadata() {
     log_info "Applying metadata from JSON sidecars to all photos and videos..."
@@ -410,7 +692,7 @@ fix_single_photo_metadata() {
 }
 
 ################################################################################
-# Step 4c: Sync File Dates from EXIF (safety net)
+# Step 4d: Sync File Dates from EXIF (safety net)
 ################################################################################
 sync_file_dates_from_exif() {
     log_info "Syncing file modification dates from EXIF for all media..."
@@ -549,7 +831,7 @@ organize_albums() {
             if [ -d "$album" ]; then
                 album_name=$(basename "$album")
                 photo_count=$(find "$album" -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" -o -iname "*.heic" -o -iname "*.gif" -o -iname "*.mp4" -o -iname "*.mov" \) 2>/dev/null | wc -l | tr -d ' ')
-                echo "   📁 $album_name ($photo_count files)"
+                echo "   � $album_name ($photo_count files)"
             fi
         done
     fi
@@ -661,7 +943,7 @@ generate_report() {
                 if [ -d "$album" ]; then
                     album_name=$(basename "$album")
                     photo_count=$(find "$album" -type f 2>/dev/null | wc -l | tr -d ' ')
-                    printf "│  📁 %-40s %5s files │\n" "$album_name" "$photo_count"
+                    printf "│  � %-40s %5s files │\n" "$album_name" "$photo_count"
                 fi
             done
             echo "└─────────────────────────────────────────────────────────┘"
@@ -674,8 +956,11 @@ generate_report() {
         echo "│  ✓ DateTimeOriginal set from Google's timestamp          │"
         echo "│  ✓ File modification times corrected                     │"
         echo "│  ✓ GPS coordinates preserved (where available)           │"
+        echo "│  ✓ Live Photo videos removed                             │"
+        echo "│  ✓ Short videos (< 5 sec) filtered out                   │"
         echo "│  ✓ Duplicates removed                                    │"
         echo "│  ✓ Photos organized by date                              │"
+        echo "│  ✓ Album photos validated in ALL_PHOTOS                  │"
         echo "└─────────────────────────────────────────────────────────┘"
         echo ""
         echo "════════════════════════════════════════════════════════════"
@@ -721,7 +1006,7 @@ show_post_migration_instructions() {
     echo -e "${BLUE}Your processed photo library is ready at:${NC}"
     echo ""
     echo "  📁 ALL_PHOTOS: $PROCESSED_FOLDER"
-    echo "  📁 ALBUMS:     $ALBUMS_FOLDER"
+    echo "  � ALBUMS:     $ALBUMS_FOLDER"
     echo ""
     echo -e "${BLUE}Quick Actions:${NC}"
     echo ""
@@ -758,8 +1043,10 @@ main() {
     echo "║  This script will:                                         ║"
     echo "║  • Merge JSON metadata into photo EXIF                     ║"
     echo "║  • Fix timestamps to reflect actual photo date             ║"
+    echo "║  • Remove Live Photo videos & short clips (< 5 sec)        ║"
     echo "║  • Remove duplicates                                       ║"
     echo "║  • Organize by year and recreate albums                    ║"
+    echo "║  • Validate album photos exist in ALL_PHOTOS               ║"
     echo "╚════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
     echo ""

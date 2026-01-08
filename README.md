@@ -9,11 +9,26 @@ This script solves the challenge of migrating your entire Google Photos library 
 - **Collecting ALL photos** from both date folders AND album folders into one unified library
 - **Merging JSON metadata** from Google Takeout into file EXIF data
 - **Fixing timestamps** so photos reflect their actual creation date (not export date)
-- **Removing Live Photo videos** (the short video clips paired with photos)
-- **Filtering short videos** (keeps only videos 5 seconds or longer)
+- **Removing only Live Photo videos** (MOV files paired with HEIC photos, under 3 seconds)
 - **De-duplicating** photos across multiple Takeout archives
 - **Organizing by year** into a single `ALL_PHOTOS` folder
 - **Generating a detailed report** with counts, sizes, and upload instructions
+
+## ✨ Features
+
+- ✅ **Conservative filtering** - Only removes confirmed Live Photo videos, keeps everything else
+- ✅ Automatic prerequisite checking and installation
+- ✅ Handles multiple Google Takeout exports in a single run
+- ✅ Collects from ALL folders (date-based AND albums) - no photos left behind
+- ✅ Supports all common image formats (JPG, JPEG, PNG, HEIC, GIF, WebP, BMP, TIFF)
+- ✅ Supports all video formats (MP4, MOV, AVI, MKV, M4V, 3GP) - **all videos kept!**
+- ✅ Fixes EXIF DateTimeOriginal and file modification dates
+- ✅ Preserves GPS coordinates when available
+- ✅ Smart duplicate detection using file hashing
+- ✅ Progress indicators for large libraries
+- ✅ Comprehensive migration report with statistics
+- ✅ Fallback date recovery from folder structure
+- ✅ Non-destructive (always works on copies, not originals)
 
 ## 📋 Prerequisites
 
@@ -110,18 +125,20 @@ Since all album photos are validated to exist in `ALL_PHOTOS`:
 
 ## 🔧 What Gets Filtered
 
-### Live Photos
-The script detects and removes Live Photo video components by looking for video files that have a matching image file with the same base name. For example:
+### Live Photos Only
+The script uses **conservative filtering** - it only removes files that are definitely Live Photo video components:
+
+- **Only MOV files** are considered (not MP4 or other formats)
+- **Must have a matching HEIC file** with the exact same base name
+- **Must be under 5MB** in size (real videos are larger)
+- **Must be under 3 seconds** in duration
+
+For example:
 - `IMG_1234.HEIC` (kept - the photo)
-- `IMG_1234.MOV` (removed - the Live Photo video)
+- `IMG_1234.MOV` (removed only if small and short - it's a Live Photo video)
+- `VacationVideo.MOV` (kept - no matching HEIC, it's a real video)
 
-### Short Videos
-Videos under 5 seconds are automatically removed. This filters out:
-- Live Photo videos that weren't caught by name matching
-- Accidental recordings
-- Burst video clips
-
-Videos 5 seconds or longer are kept and have their metadata fixed.
+**All other photos and videos are kept!** The script is designed to be conservative and never delete content you might want.
 
 ## 🛠️ What Each Step Does
 

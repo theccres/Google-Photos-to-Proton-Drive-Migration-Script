@@ -173,18 +173,28 @@ is_live_photo_video() {
     local base_name="${filename%.*}"
     local ext_lower=$(echo "${filename##*.}" | tr '[:upper:]' '[:lower:]')
     
-    # Only check video files
-    if [[ ! "$ext_lower" =~ ^(mov|mp4|m4v)$ ]]; then
+    # Only check MOV files - Live Photos are almost always MOV format
+    if [[ "$ext_lower" != "mov" ]]; then
         return 1
     fi
     
-    # Check if there's a matching image file (HEIC, JPG, JPEG, PNG)
-    # Live Photos typically have same base name with different extension
-    for img_ext in heic HEIC jpg JPG jpeg JPEG png PNG; do
-        if [ -f "$search_dir/${base_name}.${img_ext}" ]; then
+    # Live Photos are typically very short (1-3 seconds) and small
+    # Check file size - Live Photo videos are usually under 5MB
+    local file_size=$(stat -f%z "$video_file" 2>/dev/null || stat -c%s "$video_file" 2>/dev/null)
+    if [ -n "$file_size" ] && [ "$file_size" -gt 5000000 ]; then
+        return 1  # Too big to be a Live Photo - keep it
+    fi
+    
+    # Check if there's a matching HEIC file (Live Photos are iPhone feature)
+    # Only consider it a Live Photo if there's a HEIC with exact same name
+    if [ -f "$search_dir/${base_name}.HEIC" ] || [ -f "$search_dir/${base_name}.heic" ]; then
+        # Additional check: Live Photo videos are usually under 3 seconds
+        local duration=$(get_video_duration "$video_file")
+        local int_duration=$(echo "$duration" | cut -d. -f1)
+        if [ -n "$int_duration" ] && [ "$int_duration" -le 3 ] 2>/dev/null; then
             return 0  # This IS a Live Photo video
         fi
-    done
+    fi
     
     return 1  # Not a Live Photo video
 }
@@ -194,7 +204,7 @@ is_live_photo_video() {
 ################################################################################
 get_video_duration() {
     local video_file="$1"
-    local duration=0
+    local duration=""
     
     # Try to get duration using exiftool (most reliable for various formats)
     duration=$(exiftool -Duration -s3 "$video_file" 2>/dev/null | grep -oE '^[0-9]+\.?[0-9]*' | head -1)
@@ -218,12 +228,13 @@ get_video_duration() {
         fi
     fi
     
-    # Return 0 if we couldn't determine duration (will be filtered out)
-    echo "${duration:-0}"
+    # Return empty if we couldn't determine duration (will keep the file)
+    echo "${duration:-}"
 }
 
 ################################################################################
 # Helper: Check if file should be kept (not Live Photo, videos >= 5 sec)
+# CONSERVATIVE: When in doubt, KEEP the file
 ################################################################################
 should_keep_file() {
     local file="$1"
@@ -236,27 +247,20 @@ should_keep_file() {
         return 0  # Keep
     fi
     
-    # For videos, check if it's a Live Photo component
+    # For videos, be CONSERVATIVE - keep unless we're sure it's a Live Photo
     if [[ "$ext_lower" =~ ^(mov|mp4|m4v|avi|mkv|3gp)$ ]]; then
-        # Check if this is a Live Photo video
+        # Only filter out if it's definitely a Live Photo video
         if is_live_photo_video "$file" "$search_dir"; then
             return 1  # Don't keep - it's a Live Photo video
         fi
         
-        # Check video duration (keep if >= 5 seconds)
-        local duration=$(get_video_duration "$file")
-        if [ -n "$duration" ] && [ "$duration" != "" ]; then
-            # Handle decimal durations
-            local int_duration=$(echo "$duration" | cut -d. -f1)
-            if [ -n "$int_duration" ] && [ "$int_duration" -ge 5 ] 2>/dev/null; then
-                return 0  # Keep - video is 5+ seconds
-            fi
-        fi
-        
-        return 1  # Don't keep - video is too short or duration unknown
+        # For all other videos: KEEP THEM
+        # We no longer filter by duration - user wants to keep all videos
+        return 0  # Keep the video
     fi
     
-    return 1  # Don't keep unknown formats
+    # Keep unknown formats too - let user decide
+    return 0
 }
 
 ################################################################################
@@ -271,7 +275,7 @@ process_photos_with_metadata() {
     
     log_info "Processing photos and merging metadata..."
     log_info "This may take a while depending on library size..."
-    log_info "Filtering: Removing Live Photo videos, keeping videos >= 5 seconds"
+    log_info "Filtering: Only removing confirmed Live Photo videos (MOV paired with HEIC, <3 sec)"
     echo ""
     
     # We'll process the photos ourselves since google-photos-takeout-helper
@@ -281,7 +285,6 @@ process_photos_with_metadata() {
     local TOTAL_ALBUMS=0
     local TOTAL_DATE_PHOTOS=0
     local LIVE_PHOTOS_SKIPPED=0
-    local SHORT_VIDEOS_SKIPPED=0
     
     # Track all files added to ALL_PHOTOS for album validation
     ALL_PHOTOS_HASHES_FILE=$(mktemp)
@@ -323,14 +326,10 @@ process_photos_with_metadata() {
                             
                         # Skip JSON files and other non-media
                         if [[ "$ext_lower" =~ ^(jpg|jpeg|png|heic|gif|mp4|mov|avi|mkv|webp|bmp|tiff|tif|3gp|m4v)$ ]]; then
-                            # Check if we should keep this file (not Live Photo, video >= 5 sec)
+                            # Check if we should keep this file (only filters Live Photos)
                             if ! should_keep_file "$file" "$subfolder"; then
-                                # Track what we're skipping
-                                if is_live_photo_video "$file" "$subfolder"; then
-                                    ((LIVE_PHOTOS_SKIPPED++)) || true
-                                else
-                                    ((SHORT_VIDEOS_SKIPPED++)) || true
-                                fi
+                                # Only Live Photos get filtered now
+                                ((LIVE_PHOTOS_SKIPPED++)) || true
                                 continue
                             fi
                             
@@ -394,8 +393,9 @@ process_photos_with_metadata() {
     
     echo ""
     log_success "Copied $TOTAL_DATE_PHOTOS photos/videos to ALL_PHOTOS (by year)"
-    log_info "Skipped $LIVE_PHOTOS_SKIPPED Live Photo videos"
-    log_info "Skipped $SHORT_VIDEOS_SKIPPED short videos (< 5 seconds)"
+    if [ "$LIVE_PHOTOS_SKIPPED" -gt 0 ]; then
+        log_info "Skipped $LIVE_PHOTOS_SKIPPED Live Photo videos (MOV paired with HEIC)"
+    fi
     
     # PHASE 2: Now create album structure that references ALL_PHOTOS
     log_info ""
@@ -461,7 +461,7 @@ process_photos_with_metadata() {
 
 ################################################################################
 # Step 4b: Validate Album Photos Exist in ALL_PHOTOS
-################################################################################
+##########################################################################![1767898302373](image/google_photos_migration/1767898302373.png)![1767898309977](image/google_photos_migration/1767898309977.png)![1767898310749](image/google_photos_migration/1767898310749.png)######
 validate_album_photos() {
     log_info "Validating all album photos exist in ALL_PHOTOS..."
     
@@ -956,8 +956,7 @@ generate_report() {
         echo "│  ✓ DateTimeOriginal set from Google's timestamp          │"
         echo "│  ✓ File modification times corrected                     │"
         echo "│  ✓ GPS coordinates preserved (where available)           │"
-        echo "│  ✓ Live Photo videos removed                             │"
-        echo "│  ✓ Short videos (< 5 sec) filtered out                   │"
+        echo "│  ✓ Live Photo videos removed (MOV paired with HEIC)      │"
         echo "│  ✓ Duplicates removed                                    │"
         echo "│  ✓ Photos organized by date                              │"
         echo "│  ✓ Album photos validated in ALL_PHOTOS                  │"
@@ -1043,7 +1042,7 @@ main() {
     echo "║  This script will:                                         ║"
     echo "║  • Merge JSON metadata into photo EXIF                     ║"
     echo "║  • Fix timestamps to reflect actual photo date             ║"
-    echo "║  • Remove Live Photo videos & short clips (< 5 sec)        ║"
+    echo "║  • Remove only Live Photo videos (MOV paired with HEIC)    ║"
     echo "║  • Remove duplicates                                       ║"
     echo "║  • Organize by year and recreate albums                    ║"
     echo "║  • Validate album photos exist in ALL_PHOTOS               ║"

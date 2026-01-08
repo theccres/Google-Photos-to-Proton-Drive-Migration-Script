@@ -15,23 +15,6 @@ This script solves the challenge of migrating your entire Google Photos library 
 - **Organizing by year** into a single `ALL_PHOTOS` folder
 - **Generating a detailed report** with counts, sizes, and upload instructions
 
-## ✨ Features
-
-- ✅ Automatic prerequisite checking and installation
-- ✅ Handles multiple Google Takeout exports in a single run
-- ✅ Collects from ALL folders (date-based AND albums) - no photos left behind
-- ✅ Supports all common image formats (JPG, JPEG, PNG, HEIC, GIF, WebP, BMP, TIFF)
-- ✅ Supports video formats (MP4, MOV, AVI, MKV, M4V, 3GP)
-- ✅ Automatically removes Live Photo video components
-- ✅ Filters out videos under 5 seconds
-- ✅ Fixes EXIF DateTimeOriginal and file modification dates
-- ✅ Preserves GPS coordinates when available
-- ✅ Smart duplicate detection using file hashing
-- ✅ Progress indicators for large libraries
-- ✅ Comprehensive migration report with statistics
-- ✅ Fallback date recovery from folder structure
-- ✅ Non-destructive (always works on copies, not originals)
-
 ## 📋 Prerequisites
 
 ### Required
